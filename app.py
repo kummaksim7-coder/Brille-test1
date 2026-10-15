@@ -1,161 +1,299 @@
 ```python
 import streamlit as st
-import cv2
 import numpy as np
+import cv2
 from PIL import Image
-from io import BytesIO
 
+# -----------------------------
+# SEITENKONFIGURATION
+# -----------------------------
 st.set_page_config(
     page_title="ColorVision",
-    page_icon="👁️",
-    layout="wide"
+    page_icon="🎨",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.title("👁️ ColorVision")
-st.write(
-    "Experimentelle Bildverarbeitung für Menschen "
-    "mit Rot-Grün-Sehschwäche."
-)
+# -----------------------------
+# DESIGN
+# -----------------------------
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
-st.info(
-    "Dieses Projekt verändert die Farben digital. "
-    "Es ist kein medizinischer Test und ersetzt keine "
-    "professionelle Untersuchung des Farbsehens."
-)
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
 
+    .stApp {
+        background: linear-gradient(135deg, #0b1020 0%, #111827 55%, #172033 100%);
+        color: #f8fafc;
+    }
 
+    [data-testid="stSidebar"] {
+        background: #111827;
+        border-right: 1px solid #273449;
+    }
+
+    .hero {
+        padding: 32px;
+        border-radius: 24px;
+        background: linear-gradient(120deg, #4338ca 0%, #7c3aed 55%, #0891b2 100%);
+        margin-bottom: 28px;
+        box-shadow: 0 12px 40px rgba(0,0,0,0.2);
+    }
+
+    .hero h1 {
+        color: white;
+        font-size: 42px;
+        font-weight: 800;
+        margin: 0;
+    }
+
+    .hero p {
+        color: #e0e7ff;
+        font-size: 16px;
+        margin-top: 10px;
+        margin-bottom: 0;
+    }
+
+    .section-title {
+        font-size: 23px;
+        font-weight: 700;
+        margin: 18px 0;
+        color: #f1f5f9;
+    }
+
+    .info-card {
+        padding: 20px;
+        border: 1px solid #334155;
+        background: rgba(30, 41, 59, 0.75);
+        border-radius: 18px;
+        margin-bottom: 16px;
+    }
+
+    .info-card h3 {
+        color: #c4b5fd;
+        font-size: 17px;
+        margin-top: 0;
+    }
+
+    .info-card p {
+        color: #cbd5e1;
+        font-size: 14px;
+        line-height: 1.6;
+    }
+
+    div.stButton > button {
+        border-radius: 12px;
+        border: none;
+        background: linear-gradient(90deg, #7c3aed, #4f46e5);
+        color: white;
+        font-weight: 700;
+        padding: 12px 20px;
+        transition: 0.2s;
+    }
+
+    div.stButton > button:hover {
+        border: none;
+        color: white;
+        background: linear-gradient(90deg, #6d28d9, #4338ca);
+        transform: translateY(-1px);
+    }
+
+    [data-testid="stFileUploader"] {
+        background: rgba(30, 41, 59, 0.5);
+        border: 1px dashed #64748b;
+        border-radius: 16px;
+        padding: 12px;
+    }
+
+    .footer {
+        color: #94a3b8;
+        text-align: center;
+        padding: 28px 0 10px;
+        font-size: 12px;
+    }
+
+    #MainMenu, footer {
+        visibility: hidden;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# -----------------------------
+# BILDBEARBEITUNG
+# -----------------------------
 def process_image(image, strength, contrast):
-    """
-    Experimentelle Farbtransformation.
+    img = np.array(image.convert("RGB"))
 
-    strength: Stärke der Farbverschiebung (0 bis 100)
-    contrast: Kontrastverstärkung (0 bis 100)
-    """
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB).astype(np.float32)
 
-    # PIL-Bild in ein RGB-Array umwandeln
-    rgb = np.array(image.convert("RGB"))
+    # Experimentelle Anpassung der Farbkanäle
+    factor = strength / 100.0
+    lab[:, :, 1] = 128 + (lab[:, :, 1] - 128) * (1 + factor)
+    lab[:, :, 2] = 128 + (lab[:, :, 2] - 128) * (1 + factor)
 
-    # RGB -> Lab:
-    # L = Helligkeit, a/b = Farbinformationen
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    lab = lab.astype(np.float32)
+    lab[:, :, 0] = 128 + (lab[:, :, 0] - 128) * contrast
 
-    L = lab[:, :, 0]
-    a = lab[:, :, 1]
-    b = lab[:, :, 2]
-
-    # Stärke normieren
-    s = strength / 100.0
-
-    # Experimentelle Farbverschiebung:
-    # Die a-Achse beschreibt unter anderem den Übergang
-    # zwischen Grün und Rot.
-    #
-    # Wir verändern diese Achse abhängig von ihrer
-    # ursprünglichen Position. Das ist KEINE garantierte
-    # Korrektur einer Rot-Grün-Sehschwäche.
-    a_centered = a - 128.0
-
-    a_new = (
-        128.0
-        + a_centered * (1.0 + 1.5 * s)
-    )
-
-    # Kontrast der Farbinformationen verstärken
-    chroma_scale = 1.0 + contrast / 100.0
-
-    b_centered = b - 128.0
-    b_new = 128.0 + b_centered * chroma_scale
-
-    # Werte in den zulässigen Bereich begrenzen
-    lab[:, :, 1] = np.clip(a_new, 0, 255)
-    lab[:, :, 2] = np.clip(b_new, 0, 255)
-
-    # Zurück in RGB
-    lab = lab.astype(np.uint8)
+    lab = np.clip(lab, 0, 255).astype(np.uint8)
     result = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
     return Image.fromarray(result)
 
 
+# -----------------------------
+# SIDEBAR
+# -----------------------------
+with st.sidebar:
+    st.markdown("## 🎨 ColorVision")
+    st.caption("Dein persönlicher Farbfilter")
+
+    st.markdown("---")
+    st.markdown("### ⚙️ Einstellungen")
+
+    strength = st.slider(
+        "Farbintensität",
+        min_value=0,
+        max_value=100,
+        value=35,
+        help="Stellt ein, wie stark die Farbkanäle verändert werden."
+    )
+
+    contrast = st.slider(
+        "Kontrast",
+        min_value=0.5,
+        max_value=1.8,
+        value=1.0,
+        step=0.1
+    )
+
+    st.markdown("---")
+    st.markdown("### 💡 Tipp")
+    st.caption(
+        "Teste verschiedene Einstellungen mit Fotos, die viele unterschiedliche "
+        "Farben enthalten."
+    )
+
+    st.markdown("---")
+    st.caption("ColorVision · Experimenteller Prototyp")
+
+
+# -----------------------------
+# HEADER
+# -----------------------------
+st.markdown("""
+<div class="hero">
+    <h1>🎨 ColorVision</h1>
+    <p>Entdecke Farben auf eine neue Art. Lade ein Bild hoch und experimentiere
+    mit individuellen Farbfiltern.</p>
+</div>
+""", unsafe_allow_html=True)
+
+# -----------------------------
+# INFORMATIONSKARTEN
+# -----------------------------
+card1, card2, card3 = st.columns(3)
+
+with card1:
+    st.markdown("""
+    <div class="info-card">
+        <h3>🖼️ Bild hochladen</h3>
+        <p>Wähle ein eigenes Foto aus und starte deinen Farbvergleich.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+with card2:
+    st.markdown("""
+    <div class="info-card">
+        <h3>🎛️ Filter anpassen</h3>
+        <p>Verändere Farbintensität und Kontrast über die Einstellungen.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+with card3:
+    st.markdown("""
+    <div class="info-card">
+        <h3>🔍 Ergebnisse vergleichen</h3>
+        <p>Sieh dir das Original und die bearbeitete Version nebeneinander an.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# -----------------------------
+# UPLOAD
+# -----------------------------
+st.markdown('<div class="section-title">📤 Dein Bild</div>', unsafe_allow_html=True)
+
 uploaded_file = st.file_uploader(
     "Lade ein Bild hoch",
-    type=["png", "jpg", "jpeg", "webp"]
+    type=["png", "jpg", "jpeg", "webp"],
+    help="Unterstützte Formate: PNG, JPG, JPEG und WEBP."
 )
 
 if uploaded_file is not None:
     try:
         original = Image.open(uploaded_file).convert("RGB")
+        processed = process_image(original, strength, contrast)
 
-        st.subheader("Einstellungen")
+        st.success("Dein Bild wurde erfolgreich verarbeitet!")
 
-        col1, col2 = st.columns(2)
+        col1, col2 = st.columns(2, gap="large")
 
         with col1:
-            strength = st.slider(
-                "Stärke der Farbverschiebung",
-                min_value=0,
-                max_value=100,
-                value=40,
-                help="Stellt ein, wie stark die Rot-Grün-Farbachse "
-                     "verändert wird."
-            )
+            st.markdown("### Original")
+            st.image(original, use_container_width=True)
 
         with col2:
-            contrast = st.slider(
-                "Farbkontrast",
-                min_value=0,
-                max_value=100,
-                value=20,
-                help="Verändert den Kontrast entlang der "
-                     "zweiten Farbachse."
-            )
+            st.markdown("### ColorVision-Filter")
+            st.image(processed, use_container_width=True)
 
-        processed = process_image(
-            original,
-            strength,
-            contrast
-        )
+        st.markdown("---")
 
-        col1, col2 = st.columns(2)
+        image_col, settings_col = st.columns([2, 1])
 
-        with col1:
-            st.subheader("Original")
-            st.image(
-                original,
+        with image_col:
+            st.markdown("### 📥 Ergebnis speichern")
+            st.caption("Lade die bearbeitete Version als PNG herunter.")
+
+        with settings_col:
+            from io import BytesIO
+
+            buffer = BytesIO()
+            processed.save(buffer, format="PNG")
+
+            st.download_button(
+                label="⬇️ Bild herunterladen",
+                data=buffer.getvalue(),
+                file_name="colorvision_result.png",
+                mime="image/png",
                 use_container_width=True
             )
 
-        with col2:
-            st.subheader("Veränderte Farben")
-            st.image(
-                processed,
-                use_container_width=True
-            )
-
-        # Bearbeitetes Bild zum Download bereitstellen
-        buffer = BytesIO()
-        processed.save(buffer, format="PNG")
-
-        st.download_button(
-            label="Bearbeitetes Bild herunterladen",
-            data=buffer.getvalue(),
-            file_name="colorvision_result.png",
-            mime="image/png"
+        st.info(
+            "Hinweis: Dieser Filter verändert die Farben eines Bildes experimentell. "
+            "Er ist nicht individuell auf eine Farbsehschwäche abgestimmt und "
+            "garantiert keine bessere Unterscheidbarkeit von Farben."
         )
 
-        st.caption(
-            "Hinweis: Diese experimentelle Transformation "
-            "kann Farben verändern, ohne die Unterscheidbarkeit "
-            "für eine bestimmte Person zu verbessern."
-        )
-
-    except Exception as error:
-        st.error(f"Das Bild konnte nicht verarbeitet werden: {error}")
+    except Exception as e:
+        st.error(f"Das Bild konnte nicht verarbeitet werden: {e}")
 
 else:
-    st.write(
-        "Lade ein Bild hoch, um die Farbtransformation "
-        "auszuprobieren."
-    )
+    st.markdown("""
+    <div class="info-card">
+        <h3>✨ Bereit zum Start?</h3>
+        <p>Lade oben ein Bild hoch. Danach erscheinen hier das Original,
+        die bearbeitete Version und die Download-Funktion.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# -----------------------------
+# FOOTER
+# -----------------------------
+st.markdown("""
+<div class="footer">
+    COLORVISION · EXPERIMENTELLES PROJEKT<br>
+    Kein medizinisches Diagnose- oder Behandlungssystem.
+</div>
+""", unsafe_allow_html=True)
 ```
