@@ -1,232 +1,141 @@
-import streamlit as st
+import threading
+
+import av
 import cv2
 import numpy as np
-from PIL import Image
-import tempfile
-import os
+import streamlit as st
+from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, webrtc_streamer
 
 st.set_page_config(
-    page_title="ColorVision",
-    page_icon="👁️",
-    layout="wide"
+    page_title="Live-Farbfilter",
+    page_icon="🎨",
+    layout="centered",
 )
 
-st.title("👁️ ColorVision")
-st.write("Vergleiche das Originalvideo mit der gefilterten Version.")
+st.title("🎨 Live-Farbfilter")
+st.write(
+    "Zeige das Kamerabild live an und probiere verschiedene Farbfilter aus. "
+    "Die Verarbeitung erfolgt Bild für Bild."
+)
 
-# Design
-st.markdown("""
-<style>
-.stApp {
-    background: linear-gradient(135deg, #10172a, #202044);
-    color: white;
+st.info(
+    "Hinweis: Die Filter verändern Farben, sie korrigieren Farbenblindheit aber nicht "
+    "medizinisch und garantieren keine zuverlässige Unterscheidung von Farben."
+)
+
+# Einstellungen werden zwischen Streamlit-Oberfläche und Video-Thread geteilt.
+settings_lock = threading.Lock()
+settings = {
+    "filter_mode": "Rot-Grün",
+    "intensity": 60,
+    "mirror": True,
 }
-h1, h2, h3, p, label {
-    color: white !important;
-}
-</style>
-""", unsafe_allow_html=True)
 
 
-# Filterfunktion
-def apply_filter(frame, strength, mode):
-    # BGR -> LAB
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
+def apply_filter(frame: np.ndarray, mode: str, intensity: int) -> np.ndarray:
+    """Apply a selectable colour filter to a BGR OpenCV frame."""
+    if mode == "Ohne Filter" or intensity <= 0:
+        return frame
 
-    L = lab[:, :, 0]
-    A = lab[:, :, 1]
-    B = lab[:, :, 2]
-
-    amount = strength / 100.0
-
+    strength = float(intensity) / 100.0
     if mode == "Rot-Grün":
-        # Experimentelle Veränderung der Rot-Grün-Farbwahrnehmung
-        A = 128 + (A - 128) * (1 + amount)
-        B = 128 + (B - 128) * (1 + amount * 0.35)
+        # LAB's a-channel represents the green-to-red axis.
+        # Expanding it can make red/green differences more noticeable.
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        lab_float = lab.astype(np.float32)
+        a = lab_float[:, :, 1]
+        contrast = 1.0 + 1.25 * strength
+        lab_float[:, :, 1] = np.clip(128.0 + (a - 128.0) * contrast, 0, 255)
+        filtered = cv2.cvtColor(
+            np.clip(lab_float, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR
+        )
+        return cv2.addWeighted(frame, 1.0 - 0.75 * strength, filtered, 0.75 * strength, 0)
 
-    elif mode == "Farbverschiebung":
-        A = A + amount * 12
-        B = B - amount * 8
+    if mode == "Farbverschiebung":
+        # Shift hue gradually while preserving brightness and most saturation.
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hsv = hsv.astype(np.int16)
+        hue_shift = int(round(18 * strength))  # OpenCV hue range is 0..179
+        hsv[:, :, 0] = (hsv[:, :, 0] + hue_shift) % 180
+        filtered = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        return cv2.addWeighted(frame, 1.0 - 0.85 * strength, filtered, 0.85 * strength, 0)
 
-    elif mode == "Starker Filter":
-        A = 128 + (A - 128) * (1 + amount * 1.5)
-        B = 128 + (B - 128) * (1 + amount)
+    if mode == "Starker Filter":
+        # Stronger green/red-axis separation plus a modest saturation boost.
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
+        lab[:, :, 1] = np.clip(128.0 + (lab[:, :, 1] - 128.0) * (1.0 + 2.0 * strength), 0, 255)
+        filtered = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+        hsv = cv2.cvtColor(filtered, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + 0.35 * strength), 0, 255)
+        filtered = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        return cv2.addWeighted(frame, 1.0 - 0.9 * strength, filtered, 0.9 * strength, 0)
 
-    lab[:, :, 0] = np.clip(L * 1.8 - 102, 0, 255)
-    lab[:, :, 1] = np.clip(A, 0, 255)
-    lab[:, :, 2] = np.clip(B, 0, 255)
-
-    lab = lab.astype(np.uint8)
-
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return frame
 
 
-# Einstellungen
-st.subheader("Filtereinstellungen")
+class LiveFilterProcessor(VideoProcessorBase):
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        image = frame.to_ndarray(format="bgr24")
 
-mode = st.selectbox(
-    "Filter auswählen",
-    ["Rot-Grün", "Farbverschiebung", "Starker Filter"]
+        with settings_lock:
+            mode = settings["filter_mode"]
+            intensity = settings["intensity"]
+            mirror = settings["mirror"]
+
+        if mirror:
+            image = cv2.flip(image, 1)
+
+        image = apply_filter(image, mode, intensity)
+        return av.VideoFrame.from_ndarray(image, format="bgr24")
+
+
+with st.sidebar:
+    st.header("Filter einstellen")
+    filter_mode = st.selectbox(
+        "Filter",
+        ["Rot-Grün", "Farbverschiebung", "Starker Filter", "Ohne Filter"],
+        index=0,
+        help="Wähle aus, wie das Live-Kamerabild verändert werden soll.",
+    )
+    intensity = st.slider(
+        "Farbintensität",
+        min_value=0,
+        max_value=100,
+        value=60,
+        step=5,
+        help="0 = keine sichtbare Wirkung, 100 = maximale Wirkung des gewählten Filters.",
+    )
+    mirror = st.toggle("Bild spiegeln", value=True)
+    st.caption("Die Einstellungen werden während des laufenden Videos übernommen.")
+
+with settings_lock:
+    settings["filter_mode"] = filter_mode
+    settings["intensity"] = intensity
+    settings["mirror"] = mirror
+
+st.subheader("Live-Kamerabild")
+st.write("Tippe auf **START** und erlaube deinem Browser den Kamerazugriff.")
+
+rtc_configuration = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
-strength = st.slider(
-    "Filterstärke",
-    min_value=0,
-    max_value=500,
-    value=150,
-    step=10
+webrtc_streamer(
+    key="live-colour-filter",
+    video_processor_factory=LiveFilterProcessor,
+    rtc_configuration=rtc_configuration,
+    media_stream_constraints={
+        "video": {
+            "facingMode": {"ideal": "environment"},
+            "width": {"ideal": 640},
+            "height": {"ideal": 480},
+        },
+        "audio": False,
+    },
+    async_processing=True,
 )
 
-uploaded_video = st.file_uploader(
-    "Video hochladen",
-    type=["mp4", "mov", "avi", "mkv"]
+st.caption(
+    "Tipp: Öffne den Streamlit-Link auf deinem Handy in Chrome oder Safari. "
+    "Die Kamera funktioniert nur, wenn du den Zugriff erlaubst und die Seite über HTTPS läuft."
 )
-
-if uploaded_video is not None:
-    # Temporäre Videodatei speichern
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".mp4"
-    ) as temp_input:
-        temp_input.write(uploaded_video.read())
-        input_path = temp_input.name
-
-    # Video öffnen
-    cap = cv2.VideoCapture(input_path)
-
-    if not cap.isOpened():
-        st.error("Das Video konnte nicht geöffnet werden.")
-        os.remove(input_path)
-        st.stop()
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    if fps <= 0:
-        fps = 25
-
-    if width <= 0 or height <= 0:
-        st.error("Die Videogröße konnte nicht erkannt werden.")
-        cap.release()
-        os.remove(input_path)
-        st.stop()
-
-    st.write(f"**Video:** {width} × {height} Pixel · {fps:.1f} FPS")
-
-    # Fortschrittsanzeige
-    progress = st.progress(0)
-    status = st.empty()
-
-    # Gefilterte Frames sammeln
-    filtered_frames = []
-
-    frame_count = 0
-
-    while True:
-        success, frame = cap.read()
-
-        if not success:
-            break
-
-        filtered = apply_filter(frame, strength, mode)
-        filtered_frames.append(filtered)
-
-        frame_count += 1
-
-        if total_frames > 0:
-            progress.progress(
-                min(frame_count / total_frames, 1.0)
-            )
-
-        status.write(
-            f"Verarbeite Video: {frame_count} Frames"
-        )
-
-    cap.release()
-    os.remove(input_path)
-
-    progress.empty()
-    status.empty()
-
-    if not filtered_frames:
-        st.error("Es konnten keine Videoframes gelesen werden.")
-        st.stop()
-
-    # Gefiltertes Video erstellen
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".mp4"
-    ) as temp_output:
-        output_path = temp_output.name
-
-    try:
-        import imageio_ffmpeg
-
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-
-        import subprocess
-
-        command = [
-            ffmpeg,
-            "-y",
-            "-loglevel", "error",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-s", f"{width}x{height}",
-            "-r", str(fps),
-            "-i", "-",
-            "-an",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            output_path
-        ]
-
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE
-        )
-
-        for frame in filtered_frames:
-            process.stdin.write(frame.tobytes())
-
-        process.stdin.close()
-        error_output = process.stderr.read()
-        return_code = process.wait()
-
-        if return_code != 0:
-            raise RuntimeError(error_output.decode(
-                "utf-8", errors="replace"
-            ))
-
-        # Videos anzeigen
-        st.success("Video erfolgreich verarbeitet!")
-
-        st.subheader("1. Originalvideo")
-        st.video(uploaded_video)
-
-        st.subheader("2. Video mit ColorVision-Filter")
-        with open(output_path, "rb") as video_file:
-            filtered_video = video_file.read()
-
-        st.video(filtered_video)
-
-        st.download_button(
-            label="Gefiltertes Video herunterladen",
-            data=filtered_video,
-            file_name="colorvision_filtered.mp4",
-            mime="video/mp4"
-        )
-
-    except Exception as e:
-        st.error(f"Fehler bei der Videoverarbeitung: {e}")
-
-    finally:
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        
