@@ -12,63 +12,91 @@ st.set_page_config(
     layout="centered",
 )
 
-st.title("🎨 Live-Farbfilter")
+st.title("🎨 Live-Farbfilter fürs Handy")
 st.write(
-    "Zeige das Kamerabild live an und probiere verschiedene Farbfilter aus. "
-    "Die Verarbeitung erfolgt Bild für Bild."
+    "Starte die Kamera und wähle einen Filter. Die Änderungen an Filter und "
+    "Intensität werden live auf das Kamerabild angewendet."
 )
 
 st.info(
-    "Hinweis: Die Filter verändern Farben, sie korrigieren Farbenblindheit aber nicht "
-    "medizinisch und garantieren keine zuverlässige Unterscheidung von Farben."
+    "Wichtig: Das ist ein experimenteller Farbfilter. Er kann Farben sichtbarer "
+    "verändern, ist aber keine medizinische Korrektur von Farbenblindheit."
 )
 
-# Einstellungen werden zwischen Streamlit-Oberfläche und Video-Thread geteilt.
+# Diese Einstellungen werden vom Streamlit-Teil und vom Video-Thread verwendet.
 settings_lock = threading.Lock()
 settings = {
-    "filter_mode": "Rot-Grün",
-    "intensity": 60,
-    "mirror": True,
+    "filter_mode": "Rot-Grün-Hilfe",
+    "intensity": 80,
+    "mirror": False,
 }
 
 
 def apply_filter(frame: np.ndarray, mode: str, intensity: int) -> np.ndarray:
-    """Apply a selectable colour filter to a BGR OpenCV frame."""
+    """Wendet einen deutlich sichtbaren Farbfilter auf ein BGR-Bild an."""
     if mode == "Ohne Filter" or intensity <= 0:
         return frame
 
     strength = float(intensity) / 100.0
-    if mode == "Rot-Grün":
-        # LAB's a-channel represents the green-to-red axis.
-        # Expanding it can make red/green differences more noticeable.
-        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        lab_float = lab.astype(np.float32)
-        a = lab_float[:, :, 1]
-        contrast = 1.0 + 1.25 * strength
-        lab_float[:, :, 1] = np.clip(128.0 + (a - 128.0) * contrast, 0, 255)
-        filtered = cv2.cvtColor(
-            np.clip(lab_float, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR
+    original = frame.copy()
+
+    if mode == "Rot-Grün-Hilfe":
+        # Verschiebt Grün-Töne deutlich in Richtung Türkis/Blau und Rot-Töne
+        # in Richtung Orange. So werden die Farbbereiche sichtbar verändert.
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hue = hsv[:, :, 0]
+        sat = hsv[:, :, 1]
+
+        # OpenCV-Hue: 0..179. Grünbereich wird Richtung Cyan verschoben.
+        green_mask = (hue >= 25) & (hue <= 85) & (sat >= 35)
+        hsv[:, :, 0][green_mask] = np.clip(
+            hue[green_mask] + 25.0 * strength, 0, 179
         )
-        return cv2.addWeighted(frame, 1.0 - 0.75 * strength, filtered, 0.75 * strength, 0)
+
+        # Rottöne (nahe 0 oder 179) werden Richtung Orange verschoben.
+        red_mask = ((hue <= 10) | (hue >= 170)) & (sat >= 35)
+        red_hue = hue[red_mask]
+        hsv[:, :, 0][red_mask] = np.where(
+            red_hue >= 170,
+            (red_hue + 180.0 + 7.0 * strength) % 180.0,
+            np.clip(red_hue + 7.0 * strength, 0, 179),
+        )
+
+        # Etwas mehr Farbsättigung, damit die Änderung klar erkennbar ist.
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + 0.45 * strength), 0, 255)
+        filtered = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        return cv2.addWeighted(original, 1.0 - strength, filtered, strength, 0)
 
     if mode == "Farbverschiebung":
-        # Shift hue gradually while preserving brightness and most saturation.
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        hsv = hsv.astype(np.int16)
-        hue_shift = int(round(18 * strength))  # OpenCV hue range is 0..179
-        hsv[:, :, 0] = (hsv[:, :, 0] + hue_shift) % 180
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[:, :, 0] = (hsv[:, :, 0] + 35.0 * strength) % 180.0
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + 0.25 * strength), 0, 255)
         filtered = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-        return cv2.addWeighted(frame, 1.0 - 0.85 * strength, filtered, 0.85 * strength, 0)
+        return cv2.addWeighted(original, 1.0 - strength, filtered, strength, 0)
 
-    if mode == "Starker Filter":
-        # Stronger green/red-axis separation plus a modest saturation boost.
-        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
-        lab[:, :, 1] = np.clip(128.0 + (lab[:, :, 1] - 128.0) * (1.0 + 2.0 * strength), 0, 255)
-        filtered = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    if mode == "Kontrast + Farbe":
+        # Sichtbar kräftigere Farben und höherer Kontrast.
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+
+        # Kontrast im Helligkeitskanal erhöhen.
+        l_float = l_channel.astype(np.float32)
+        l_float = 128.0 + (l_float - 128.0) * (1.0 + 0.8 * strength)
+        l_channel = np.clip(l_float, 0, 255).astype(np.uint8)
+
+        # Farbkanäle stärker aus der neutralen Mitte herausziehen.
+        a_float = 128.0 + (a_channel.astype(np.float32) - 128.0) * (1.0 + 1.8 * strength)
+        b_float = 128.0 + (b_channel.astype(np.float32) - 128.0) * (1.0 + 1.2 * strength)
+        lab = cv2.merge((
+            l_channel,
+            np.clip(a_float, 0, 255).astype(np.uint8),
+            np.clip(b_float, 0, 255).astype(np.uint8),
+        ))
+        filtered = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
         hsv = cv2.cvtColor(filtered, cv2.COLOR_BGR2HSV).astype(np.float32)
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + 0.35 * strength), 0, 255)
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + 0.5 * strength), 0, 255)
         filtered = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-        return cv2.addWeighted(frame, 1.0 - 0.9 * strength, filtered, 0.9 * strength, 0)
+        return cv2.addWeighted(original, 1.0 - strength, filtered, strength, 0)
 
     return frame
 
@@ -77,11 +105,13 @@ class LiveFilterProcessor(VideoProcessorBase):
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         image = frame.to_ndarray(format="bgr24")
 
+        # Einstellungen bei jedem Bild neu lesen, damit die Regler live greifen.
         with settings_lock:
             mode = settings["filter_mode"]
             intensity = settings["intensity"]
             mirror = settings["mirror"]
 
+        # Standardmäßig NICHT spiegeln. So bewegen sich Dinge in die erwartete Richtung.
         if mirror:
             image = cv2.flip(image, 1)
 
@@ -93,20 +123,29 @@ with st.sidebar:
     st.header("Filter einstellen")
     filter_mode = st.selectbox(
         "Filter",
-        ["Rot-Grün", "Farbverschiebung", "Starker Filter", "Ohne Filter"],
+        [
+            "Rot-Grün-Hilfe",
+            "Farbverschiebung",
+            "Kontrast + Farbe",
+            "Ohne Filter",
+        ],
         index=0,
-        help="Wähle aus, wie das Live-Kamerabild verändert werden soll.",
+        help="Wähle einen Filter. Die Wirkung sollte direkt im Kamerabild sichtbar sein.",
     )
     intensity = st.slider(
         "Farbintensität",
         min_value=0,
         max_value=100,
-        value=60,
+        value=80,
         step=5,
-        help="0 = keine sichtbare Wirkung, 100 = maximale Wirkung des gewählten Filters.",
+        help="0 = keine Filterwirkung, 100 = stärkste Filterwirkung.",
     )
-    mirror = st.toggle("Bild spiegeln", value=True)
-    st.caption("Die Einstellungen werden während des laufenden Videos übernommen.")
+    mirror = st.toggle(
+        "Bild spiegeln (Selfie-Ansicht)",
+        value=False,
+        help="Aus: normale Ansicht. Ein: links und rechts werden vertauscht.",
+    )
+    st.caption("Filter oder Intensität ändern, während die Kamera läuft.")
 
 with settings_lock:
     settings["filter_mode"] = filter_mode
@@ -114,14 +153,14 @@ with settings_lock:
     settings["mirror"] = mirror
 
 st.subheader("Live-Kamerabild")
-st.write("Tippe auf **START** und erlaube deinem Browser den Kamerazugriff.")
+st.write("Tippe auf **START** und erlaube den Kamerazugriff. Falls du schon gestartet hast, ändere links den Filter.")
 
 rtc_configuration = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
 webrtc_streamer(
-    key="live-colour-filter",
+    key="live-colour-filter-v2",
     video_processor_factory=LiveFilterProcessor,
     rtc_configuration=rtc_configuration,
     media_stream_constraints={
@@ -136,6 +175,7 @@ webrtc_streamer(
 )
 
 st.caption(
-    "Tipp: Öffne den Streamlit-Link auf deinem Handy in Chrome oder Safari. "
-    "Die Kamera funktioniert nur, wenn du den Zugriff erlaubst und die Seite über HTTPS läuft."
+    "Tipp: Öffne die HTTPS-Streamlit-Adresse direkt in Chrome oder Safari. "
+    "Wenn du den Code auf GitHub ersetzt, warte auf den Neustart der Streamlit-App "
+    "und lade die Seite auf dem Handy neu."
 )
