@@ -1,12 +1,16 @@
 import streamlit as st
-import numpy as np
 import cv2
-from PIL import Image
-from io import BytesIO
+import numpy as np
+import tempfile
+import os
+import subprocess
+import imageio_ffmpeg
+
+from pathlib import Path
 
 
 # ==================================================
-# KONFIGURATION
+# SEITENKONFIGURATION
 # ==================================================
 
 st.set_page_config(
@@ -25,19 +29,12 @@ st.markdown(
     <style>
     .stApp {
         background: linear-gradient(
-            135deg,
-            #0b1020,
-            #111827,
-            #172033
+            135deg, #0b1020, #111827, #172033
         );
         color: white;
     }
 
-    html, body, [class*="css"] {
-        color: white;
-    }
-
-    h1, h2, h3, h4, p, label, span, li {
+    h1, h2, h3, h4, p, label, span {
         color: white;
     }
 
@@ -53,23 +50,13 @@ st.markdown(
         padding: 32px;
         border-radius: 22px;
         background: linear-gradient(
-            120deg,
-            #4338ca,
-            #7c3aed,
-            #0891b2
+            120deg, #4338ca, #7c3aed, #0891b2
         );
         margin-bottom: 25px;
     }
 
-    .hero h1 {
-        font-size: 40px;
-        font-weight: 800;
+    .hero h1, .hero p {
         color: white !important;
-    }
-
-    .hero p {
-        color: white !important;
-        line-height: 1.8;
     }
 
     .card {
@@ -101,12 +88,6 @@ st.markdown(
         min-height: 42px;
     }
 
-    div.stButton > button:hover,
-    div.stDownloadButton > button:hover {
-        background: #7c3aed;
-        border-color: #a78bfa;
-    }
-
     [data-testid="stAlert"] * {
         color: white !important;
     }
@@ -117,31 +98,30 @@ st.markdown(
 
 
 # ==================================================
-# FILTERFUNKTIONEN
+# VIDEO-FILTER
 # ==================================================
 
-def process_image(image, strength, mode):
+def apply_color_filter(frame, strength, mode):
     """
-    Experimentelle Farbfilter für Ishihara-Bilder.
+    Experimenteller Farbfilter für einzelne Videoframes.
 
-    Die Filter sind keine medizinischen Verfahren und
-    garantieren keine bessere Erkennbarkeit.
+    frame: OpenCV-Bild im BGR-Format.
+    strength: Farbintensität von 0 bis 500.
+    mode: ausgewählter Filtermodus.
     """
 
-    rgb = np.array(image.convert("RGB"))
+    # BGR nach RGB
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # RGB nach LAB
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(
         np.float32
     )
 
-    # Kontrast ist immer fest auf 1.80 eingestellt.
-    contrast = 1.80
-
-    # Stärke 0 bis 500 -> Faktor 0 bis 5.
     amount = strength / 100.0
 
-    # LAB-Farbkanäle:
-    # Kanal 0 = Helligkeit
-    # Kanal 1 und 2 = Farbinformationen
+    # Kontrast fest auf 1,80
+    contrast = 1.80
 
     if mode == "Standard":
         lab[:, :, 1] = (
@@ -153,8 +133,6 @@ def process_image(image, strength, mode):
         )
 
     elif mode == "Rot-Grün":
-        # Experimentelle Verschiebung der Farbkanäle.
-        # Keine gezielte medizinische Korrektur.
         lab[:, :, 1] = (
             128 + (lab[:, :, 1] - 128) * (1 + amount)
         )
@@ -166,7 +144,6 @@ def process_image(image, strength, mode):
         lab[:, :, 1] += amount * 8
 
     elif mode == "Farbverschiebung":
-        # Farbachsen in unterschiedliche Richtungen verschieben.
         lab[:, :, 1] += amount * 10
         lab[:, :, 2] -= amount * 10
 
@@ -181,16 +158,148 @@ def process_image(image, strength, mode):
 
         lab[:, :, 1] += amount * 12
 
-    # Helligkeitskontrast konstant auf 1.80.
+    # Kontrast anpassen
     lab[:, :, 0] = (
         128 + (lab[:, :, 0] - 128) * contrast
     )
 
     lab = np.clip(lab, 0, 255).astype(np.uint8)
 
-    result = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    # LAB nach RGB und danach zurück nach BGR
+    result_rgb = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
-    return Image.fromarray(result)
+    result_bgr = cv2.cvtColor(
+        result_rgb,
+        cv2.COLOR_RGB2BGR
+    )
+
+    return result_bgr
+
+
+# ==================================================
+# VIDEO VERARBEITEN
+# ==================================================
+
+def process_video(input_path, output_path, strength, mode):
+    """
+    Verarbeitet das Video frameweise und erzeugt
+    anschließend eine MP4-Datei.
+    """
+
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
+    # Video-Informationen lesen
+    cap = cv2.VideoCapture(input_path)
+
+    if not cap.isOpened():
+        raise RuntimeError("Das Video konnte nicht geöffnet werden.")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if fps <= 0 or width <= 0 or height <= 0:
+        cap.release()
+        raise RuntimeError("Die Videoeigenschaften sind ungültig.")
+
+    # FFmpeg erwartet unkomprimierte Videoframes über stdin.
+    command = [
+        ffmpeg,
+        "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "-",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    frame_number = 0
+
+    try:
+        while True:
+            success, frame = cap.read()
+
+            if not success:
+                break
+
+            # Farbfilter anwenden
+            filtered_frame = apply_color_filter(
+                frame,
+                strength,
+                mode,
+            )
+
+            # Frame an FFmpeg übergeben
+            process.stdin.write(
+                filtered_frame.tobytes()
+            )
+
+            frame_number += 1
+
+            if total_frames > 0:
+                progress = min(
+                    frame_number / total_frames,
+                    1.0,
+                )
+
+                progress_bar.progress(progress)
+
+                status_text.write(
+                    f"Verarbeite Video: "
+                    f"{frame_number} / {total_frames} Frames"
+                )
+
+    except Exception:
+        if process.poll() is None:
+            process.kill()
+
+        raise
+
+    finally:
+        cap.release()
+
+    # Eingabestream schließen, damit FFmpeg fertig wird.
+    process.stdin.close()
+
+    stderr_output = process.stderr.read().decode(
+        "utf-8",
+        errors="replace",
+    )
+
+    return_code = process.wait()
+
+    if return_code != 0:
+        raise RuntimeError(
+            "FFmpeg konnte das Video nicht erstellen:\n"
+            + stderr_output[-3000:]
+        )
+
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError("Die Ausgabedatei wurde nicht erstellt.")
+
+    progress_bar.progress(1.0)
+    status_text.success("Video erfolgreich verarbeitet!")
+
+    return fps, total_frames
 
 
 # ==================================================
@@ -199,8 +308,7 @@ def process_image(image, strength, mode):
 
 with st.sidebar:
     st.markdown("# 🎨 ColorVision")
-
-    st.markdown("### Filtereinstellungen")
+    st.markdown("### Videoeinstellungen")
 
     mode = st.selectbox(
         "Filtermodus",
@@ -221,14 +329,12 @@ with st.sidebar:
     )
 
     st.markdown("---")
-
     st.markdown("### Kontrast")
-
     st.markdown("**1,80 – fest eingestellt**")
 
     st.caption(
-        "Die Filter sind experimentell. "
-        "Probiere unterschiedliche Modi aus."
+        "Die Filter sind experimentell und nicht "
+        "medizinisch validiert."
     )
 
 
@@ -239,12 +345,11 @@ with st.sidebar:
 st.markdown(
     """
     <div class="hero">
-        <h1>🎨 ColorVision</h1>
+        <h1>🎨 ColorVision Video</h1>
         <p>
-            Experimentiere mit verschiedenen Farbfiltern.
-            Vergleiche Ishihara-Tafeln und finde heraus,
-            welche Farbveränderungen für dich am besten
-            funktionieren.
+            Lade ein Video hoch und experimentiere mit
+            verschiedenen Farbfiltern. Anschließend kannst
+            du das bearbeitete Video als MP4 herunterladen.
         </p>
     </div>
     """,
@@ -253,83 +358,116 @@ st.markdown(
 
 
 # ==================================================
-# UPLOAD
+# VIDEO-UPLOAD
 # ==================================================
 
-st.markdown("## 📤 Ishihara-Tafel hochladen")
+st.markdown("## 📤 Video hochladen")
 
 uploaded_file = st.file_uploader(
-    "Wähle eine Bilddatei aus",
-    type=["png", "jpg", "jpeg", "webp"],
+    "Wähle eine Videodatei",
+    type=["mp4", "mov", "avi", "mkv"],
+    help="Für den Anfang empfehlen wir ein kurzes MP4-Video.",
 )
 
 
 # ==================================================
-# VERARBEITUNG
+# VIDEO-VERARBEITUNG
 # ==================================================
 
 if uploaded_file is not None:
-    try:
-        original = Image.open(uploaded_file).convert("RGB")
 
-        processed = process_image(
-            original,
-            strength,
-            mode,
-        )
+    st.video(uploaded_file)
 
-        st.markdown("## 🖼️ Bildvergleich")
+    st.info(
+        "Die Verarbeitung kann bei langen oder hochauflösenden "
+        "Videos einige Zeit dauern. Teste zunächst ein kurzes Video."
+    )
 
-        col1, col2 = st.columns(2, gap="large")
+    if st.button("🎬 Video mit Filter verarbeiten"):
 
-        with col1:
-            st.markdown("### Original")
-            st.image(
-                original,
-                use_container_width=True,
+        input_path = None
+        output_path = None
+
+        try:
+            # Temporäre Dateien anlegen
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=Path(uploaded_file.name).suffix,
+            ) as input_temp:
+                input_temp.write(uploaded_file.getvalue())
+                input_path = input_temp.name
+
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=".mp4",
+            ) as output_temp:
+                output_path = output_temp.name
+
+            st.markdown("## ⚙️ Verarbeitung")
+
+            fps, total_frames = process_video(
+                input_path,
+                output_path,
+                strength,
+                mode,
             )
 
-        with col2:
-            st.markdown(f"### Filter: {mode}")
-            st.image(
-                processed,
-                use_container_width=True,
-            )
+            # Ergebnis für die Sitzung speichern
+            with open(output_path, "rb") as video_file:
+                video_bytes = video_file.read()
 
-        buffer = BytesIO()
-        processed.save(buffer, format="PNG")
+            st.session_state["colorvision_video"] = video_bytes
+            st.session_state["colorvision_mode"] = mode
+            st.session_state["colorvision_strength"] = strength
 
-        st.download_button(
-            "⬇️ Bearbeitetes Bild herunterladen",
-            data=buffer.getvalue(),
-            file_name="colorvision_result.png",
-            mime="image/png",
-            use_container_width=True,
-        )
+        except Exception as error:
+            st.error("Bei der Videoverarbeitung ist ein Fehler aufgetreten.")
+            st.code(str(error))
 
-        st.info(
-            "Die Filter verändern die Farbdarstellung, "
-            "erkennen aber nicht automatisch die Zahl "
-            "auf einer Ishihara-Tafel. Ein sichtbares "
-            "Ergebnis ist kein medizinischer Farbsehtest."
-        )
+        finally:
+            for path in (input_path, output_path):
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
 
-    except Exception as error:
-        st.error("Das Bild konnte nicht verarbeitet werden.")
-        st.code(str(error))
 
-else:
-    st.markdown(
-        """
-        <div class="card">
-            <h3>✨ Bereit zum Testen?</h3>
-            <p>
-                Lade eine Ishihara-Tafel hoch und teste
-                die verschiedenen Filtermodi.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+# ==================================================
+# ERGEBNIS ANZEIGEN
+# ==================================================
+
+if "colorvision_video" in st.session_state:
+
+    st.markdown("---")
+    st.markdown("## 🎥 Dein bearbeitetes Video")
+
+    st.caption(
+        f"Filter: {st.session_state['colorvision_mode']} · "
+        f"Farbintensität: "
+        f"{st.session_state['colorvision_strength']} % · "
+        "Kontrast: 1,80"
+    )
+
+    st.video(
+        st.session_state["colorvision_video"],
+        format="video/mp4",
+    )
+
+    st.download_button(
+        label="⬇️ Bearbeitetes Video herunterladen",
+        data=st.session_state["colorvision_video"],
+        file_name="colorvision_filtered.mp4",
+        mime="video/mp4",
+        use_container_width=True,
+    )
+
+    st.info(
+        "Der Filter verändert die Farbdarstellung. "
+        "Er garantiert nicht, dass Farben für Menschen "
+        "mit Rot-Grün-Sehschwäche besser unterscheidbar "
+        "werden. Verlasse dich bei sicherheitsrelevanten "
+        "Situationen nicht auf diesen Filter."
     )
 
 
@@ -340,7 +478,7 @@ else:
 st.markdown(
     """
     <div style="text-align:center; padding:30px 0; color:white;">
-        COLORVISION · EXPERIMENTELLES PROJEKT
+        COLORVISION VIDEO · EXPERIMENTELLES PROJEKT
     </div>
     """,
     unsafe_allow_html=True,
